@@ -1,0 +1,936 @@
+; paradox memo .MB file lezen
+; prototype for reading paradox Data .DB en Memo .MB files and exporting the data. 
+; By J.W. Teunisse (info@jwteunisse.nl)
+; Date dd-11-2024, edited 12-12-2024
+; References:
+; - PARADOX4X.txt by Kevin Mitchell
+; - PxFormat.xt   by Randy Beck
+;
+; Description of memoBlob field, the last 10 Bytes: 
+; Byte(s) Betekenis             Lengte    Beschrijving
+; 0-3     Offset van memo-item  4 bytes   Positie in .mb-bestand, little-endian
+; 4-5     Lengte van memo-item  2 bytes   Lengte in bytes, little-endian
+; 6-9     Bloknummer            4 bytes   Bloknummer waarin het item zich bevindt
+; 10      Ongebruikte byte      1 byte    Gereserveerd, vaak ongebruikt
+;
+; Structuur memo *.mb file volgens ChatGPT   Is unreliable!
+; - header:
+;   Bytes 0-3: File identifier (e.g., "MB ")
+;   Bytes 4-7: Version number (e.g., 0x0005 for version 5)
+;   Bytes 8-11: Record count
+;   Bytes 12-15: Offset for the first record
+;
+; first deciphering .DB file and then the .MB file: these information is stored in the <file>.log file.
+; The exported data records are stored <file>.recs.txt file.
+;
+; todo
+; - from the fieldnamen list generate a SQL CREATE TABLE....
+; - to get the correct fieldnames list:    is done (fieldname ends with a 0x00, but in some cases the last hex value ends with a zero (0x?0)
+;   also changed is the way to get the right numner of fields based on the variable numFields form the header block 
+; - all data records are correctly processed:       in test, zo te ziet het er goed uit.
+; - op basis van de waarden uit het veld memoBlob destilleren op het een MB block type 2 (single) of type 3 (Array if Entries) heeft
+;   if index is FFh dan Type2, else if 00-3Fh, then it is Type3
+; - the memoBlob er op de goede manier er uit halen. Type2 coderen, Type3 in test, looks OK.
+; - to implement the fields:
+;   AutoInc    OK
+;   Date       ?todo gives incorrect data also timestamp, first the hex bytes start with an 8h, replace with a 0h, it differs one day with C# code 
+;   BLOb and Graphics - to get the correct bytes in a file <folder>\<filename_<blob|graphic>rec>nr>.png/jpg
+;   Short      OK
+;   TimeStamp  OK  
+;
+#include "UDF_PrcFunc.wbt"
+
+#definefunction Little2BigEndian(pSize,pBuffer)    ; returns buffer
+  bufferB = BinaryAlloc(pSize)
+  For x = 0 To pSize-2 By 2
+    ;Read out 2 hex bytes at a time
+    bytes1 = BinaryPeekHex(pBuffer, x, 1)
+    bytes2 = BinaryPeekHex(pBuffer, x+1, 1 )
+    ;Write out swapped hex bytes
+    BinaryPokeHex(bufferB, x, bytes2)
+    BinaryPokeHex(bufferB, X+1, bytes1)
+  Next
+  return bufferB
+#endfunction   ; Little2BigEndian
+
+#definefunction StrLittle2BigEndian(pSize,pLittle)  ; returns BigEndian string in uppercase
+  strLittle = StrReplace(pLittle, "0x", "")
+  strLittle = StrReplace(strLittle, "\x", "")
+  strLittle = StrReplace(strLittle, "x", "")
+  strLittle = StrUpper(strLittle)
+  strL = StrLen(strLittle)
+  strBig = ""
+  For x = 1 To pSize By 2
+    ;Read out 2 hex bytes at a time
+    strBig = StrSub(strLittle,x, 2) : strBig 
+  Next
+  return strBig
+#endfunction   ; Little2BigEndian
+
+#definefunction hex2dec(pHexStr)
+  res = 0
+  k = 0
+  char = "X"
+  pHexStr = StrUpper(pHexStr)
+  strL = StrLen(pHexStr)
+  p = -1 ; getal in hex getallenreeks 01234567890ABCDEF
+  for i = strL to 1 by -1
+    p = p+1
+    char = StrSub(pHexStr, i,1)
+    k = StrIndex("0123456789ABCDEF", char, 1, @FWDSCAN) - 1
+    res = res + k*(16**p)
+  next i
+  return res
+#endfunction ; hex2dec
+
+#definefunction hex2float(pHexStr)   ; returns double precision float
+  res = 0.00
+  pHexStr = StrUpper(pHexStr)
+  strL = StrLen(pHexStr)
+  fltBuf = BinaryAlloc(8)
+  BinaryPokeHex(fltBuf, 0, pHexStr)
+  res = BinaryPeekFlt(fltBuf,0)
+  fltBuf = BinaryFree(fltbuf)
+  return res
+#endfunction ; hex2float
+
+
+#defineFunction HexToSignedInt(pHexString, pBitWidth)   ; returns signed integer
+    ; Remove the "0x" prefix if present
+    If StrLen(pHexString) > 2 && StrSub(pHexString, 1, 2) == "0x" then
+        hexString = SubStr(hexString, 3)
+    endif
+    ; Convert hex to unsigned integer
+    unsignedValue = Hex2Dec(pHexString)
+    ; Determine the threshold for negativity
+    threshold = 1 << (pBitWidth - 1) ; 2^(bitWidth - 1)
+    ; Calculate signed value
+    If unsignedValue >= threshold then
+        signedValue = unsignedValue - (1 << pBitWidth) ; Subtract 2^n
+    Else
+        signedValue = unsignedValue
+    EndIf
+    Return signedValue
+#EndFunction
+
+#definefunction hex2String(pHexStr) ; returns string
+  res = 0
+  k = 0
+  char = "X"
+  str = ""     ; return string
+  ; pHexStr = StrUpper(pHexStr)
+  strL = StrLen(pHexStr)
+  p = -1 ; position number in hex byte array f.i. 62657374616E64006F72676E
+  for i = 1 to strL by 2
+    p = 0
+    res = 0
+    char = StrSub(pHexStr, i+1,1)
+    k = StrIndex("0123456789ABCDEF", char, 1, @FWDSCAN) - 1
+    res = res + k*(16**p)
+    char = StrSub(pHexStr, i,1)
+    k = StrIndex("0123456789ABCDEF", char, 1, @FWDSCAN) - 1
+    p = p+1
+    res = res + k*(16**p)
+    str = str : Num2Char(res)
+  next i
+  return str
+#endfunction ; hex2string
+
+; input pHexstring = list of hex values, fieldname is ended by 0x00 or '00' '
+; It could be '000' if the pHexString ends with 0x0 in the last character
+#definefunction CreateListofStrings(pHexString, pNrOfFields) ; returns list of strings f.i. listFieldNames
+  doorgaan = @TRUE
+  wrkStr = ""
+  list = ""
+  n = 0  ; fields counter
+  L = StrLen(pHexString)
+  while doorgaan
+     n += 1  ; fields counter
+     p = StrIndex(pHexString, "00", 1, @FWDSCAN)
+     p3 = StrIndex(pHexString, "000", 1, @FWDSCAN) ; check if the last character is 0x0
+     if p > 1 then ; process the string until p == 0
+        if p == p3 then  ; if this is the case then the hex string ends with a 0x0, so skip one position further
+           p += 1  ;
+        endif 
+        wrkstr = StrSub(pHexString, 1, p-1)
+        pHexString = StrSub(pHexString, p+2, L-p)
+        L = StrLen(pHexString)
+        wrkstr = hex2string(wrkstr)
+        list = list : wrkstr : ";"
+     else ; geen '00' meer
+       if L > 0 then
+         wrkstr = hex2string(pHexString)
+         list = list : wrkstr : ";"
+       endif
+       doorgaan = @FALSE
+     endif
+     if n == pNrOfFields then
+       doorgaan = @FALSE  ; tot of number fields reached
+     endif
+  endwhile 
+  return list
+#endfunction ; CreateListofStrings(pHexString, pNrOfFields) 
+
+#definesubroutine GetFieldTypeDesc(pHex) ; returns string FieldType
+   p = ItemLocateWild(strCat(pHex, "|*"), listFieldTypes,";",1)
+   return ItemExtract(2, ItemExtract(p,listFieldTypes, ";"), "|")
+#endsubroutine
+
+#definesubroutine GetFieldLength(pZoekStr) ; returns string FieldType
+   p = ItemLocateWild(strCat(pZoekStr, "|*"), listFieldInfo,";",1)
+   strL = ItemExtract(4, ItemExtract(p,listFieldInfo, ";"), "|")
+   if IsNumber(strL) then
+     p = strL*1
+   else
+     p = 0
+   endif
+   return p
+#endsubroutine
+
+#definefunction StrTrimPrefix0x0(str)
+  L = Strlen(str)
+  uitstr =str
+  doorgaan = @TRUE
+  b = 0
+  While doorgaan       ; pak de hele string
+    b = b + 1
+    if Strsub(uitstr, b, 1) == "0" then
+       L = L - 1 ; trek 1 pos. van de lengte af
+    else ; stop loop
+      uitstr = StrSub(uitstr, b, L)
+      doorgaan = @FALSE
+    end if
+  endwhile
+  return uitstr
+#endfunction  ; StrTrimPrefix0x0
+
+#definefunction HexDate2ISODate(pString)  ; returns ISO Date yyyyMMdd, pString is 4 bytes, so length of 8 hex
+  if StrLen(pString) != 8 then
+     return "error # 8 hex chars"
+  endif
+  isodate = ""
+  ;  no LittleEndian partDate = StrLittle2BigEndian(8,pString)
+  ;  if pString start with 8, replace with 0
+  if StrSub(pString, 1,1) == "8" then
+    pString = "0" : Strsub(pString, 2, 7)
+  endif
+  days = hex2dec(pString)
+  decimals(0)
+  ErrorMode(@OFF)
+  LastError( )
+  newdate = timeAdd('0001:01:01:00:00:00','0000:00:%days%:00:00:00')
+  ErrorMode(@CANCEL)
+  If LastError( )== 0 then
+    newdate = StrSub(newdate, 1, 10)
+    isodate = StrReplace(newdate, ":", "")
+  else
+   isodate = "error in date function, days %days%/0x%pString% are to big to handle"
+  EndIf
+  return isodate
+#endfunction ; HexTimeStamp2ISODate(pString)
+
+#definefunction HexTimeStamp2ISODate(pString)  ; returns ISO Date yyyyMMdd hh:mm;ss
+  if StrLen(pString) != 16 then
+     return "error # 16 hex chars"
+  endif
+  DAGSEC = 86400 ; number of seconds in a day
+  isodate = ""
+  ; according to Knabe: Stored as Float value: Integer part as days since 0001-01-01 and fractional part as fraction of a day.
+  ; Kevin Mitchell/Randy Beck: states only double precison
+  ; this not correct: in this case it is stored in a LittleEndian format and the value is in milliseconds
+  ; we convert the hex value to a floating point value
+  ; pString is in LittleEndian format
+  hexDate = StrLittle2BigEndian(16,pString) ; 8 bytes
+  hdlBin = BinaryAlloc(8)
+  BinaryPokeHex(hdlBin, 0, hexDate)
+  floatDateRev = BinaryPeekFlt(hdlBin, 0)  ; in milliseconds
+  BinaryFree(hdlBin)
+  floatDateRev = floatDateRev/1000     ; convert to seconds
+  if floatdateRev < 0 then
+     floatDateRev = -1*floatDateRev
+  endif
+  days = int(floor(FloatDateRev/DAGSEC))
+  if days < 1000 then
+    return "error in calculating nr of days"
+  endif
+  seconds =  FloatDateRev mod days
+  days = days - 1    ; in this we have to subtract one day to get the correct date 
+  decimals(0)
+  newdate = timeAdd('0001:01:01:00:00:00','0000:00:%days%:00:00:00')
+  newdate = StrSub(newdate, 1, 10)
+  isodate = StrReplace(newdate, ":", "")
+  hrs = int(floor(seconds/3600))
+  secs = seconds mod 3600
+  mins = int(floor(secs/60))  ; minutes
+  secs = secs mod 60          ; seconds
+  decimals(0)
+  if hrs > 9 then
+     strhrs = "%hrs%"
+  else
+     strhrs = "0%hrs%"
+  endif
+  if mins > 9 then
+     strmin = "%mins%"
+  else
+     strmin = "0%mins%"
+  endif
+  if secs > 9 then
+     strsec = "%secs%"
+  else
+     strsec = "0%secs%"
+  endif
+  isodate := " " : strhrs : strmin : strsec
+  return isodate
+#endfunction ; HexTimeStamp2ISODate(pString)
+
+#definefunction skipLeadingZeroes(pHexString) ; returns 
+  p = 1
+  lenStr = Strlen(pHexString)
+  doorgaan = @TRUE
+  while doorgaan
+    if StrSub(pHexString, p, 1) == "0" then
+       p += 1
+       if p == lenStr then
+          doorgaan = @False
+       endif
+    else
+      doorgaan = @FALSE
+    endif
+  endwhile
+  return StrSub(pHexString, p, lenStr-p)
+#endfunction ; skipLeadingZeroes(hexfieldNames)
+
+;-------------- main part -----------------------------
+boxTitel = StrCat("ReadParadoxFile/V_test") ;; ,thisVersion)
+boxOpen(boxtitel, "Opstarten ..")
+filename = "D:\Ontwikkelomgeving\Paradox\album.DB"  ;  gdpprs.DB"  album.DB         AREACODE.DB
+logfilename = StrReplace(filename, ".DB", ".log")
+mbfilename =  StrReplace(filename, ".DB", ".MB")
+recsfilename= StrReplace(filename, ".DB", "_recs.txt")
+listFieldTypes = "01|Text;02|Date;03|Short;04|Long;05|Currency;06|Number;07|unknown;08|unknown;09|Logical;0A|unknown;0B|unknown;0C|MemoBLOb;0D|BLOb;0E|FmtMemoBLOb;0F|OLE;10|Graphic;14|Time;15|Timestamp;16|AutoInc;17|BCD;18|Bytes;19|Unknown"
+BLOB_Present = @FALSE
+TextValue = "C2CCBE630B8D9C00"
+; test eerst de gevonden datum terug 25-12-2003 19:02:11
+days = TimeDiffDays('2003:12:25:00:00:00', '0001:01:01:00:00:00')
+decimals(0)
+newdate = timeAdd('0001:01:01:00:00:00','0000:00:%Days%:00:00:00') 
+DateValue = HexTimeStamp2ISODate(TextValue)
+DateValue = HexDate2ISODate("800A955A")  ; 30-12-1899
+DateValue = HexDate2ISODate("800B2088")  ; 19-07-1997
+CurValue = hex2float("4059200000000000")
+; p = ItemLocateWild("0C|*", listFieldTypes,";",1)
+; ft = ItemExtract(2, ItemExtract(p,listFieldTypes, ";"), "|")
+; ft = GetFieldTypeDesc("09")
+; test signed integers
+;hexValue1 = "fa01"
+;result1 = HexToSignedInt(hexValue1, 16)
+;Message("Result", "The signed integer for " : hexValue1 : " is: %result1%")
+;hexValue2 = "7FFF"
+;result2 = HexToSignedInt(hexValue2, 16)
+;Message("Result", "The signed integer for " : hexValue2 : "is %result2%")
+;hexValue3 = "8000"
+;result3 = HexToSignedInt(hexValue3, 16)
+;Message("Result", "The signed integer for " : hexValue3 : " is: %result3%")
+; test = StrTrimPrefix0x0("00000014F761")
+; StartDataBlock = 36553  ; check  DataBlock+6+addDataSize+recSize+1   ; bepaal start position of this next block
+; fx = floor(StartDataBlock/1024)
+; StartDataBlock = 1024 + 1024*fx
+; Goto MEMOGO
+bericht = "Logging Files into byte buffer "
+Boxtext(bericht)
+; testen van diverse functions en subroutines
+; testHex = "0x1b0xfa"
+; testHex = StrLittle2BigEndian(4,testHex)
+; buffertest = BinaryAlloc(2)
+; bufferResult = BinaryAlloc(2)
+; BinaryPokeHex(buffertest, 0, "0A")
+; BinaryPokeHex(buffertest, 1, "FF")
+; bufferResult = Little2BigEndian(2, buffertest)  ; pSize,pBuffer)
+; strHex = BinaryPeekHex(bufferResult, 0, 2)
+; getal = hex2dec(strHex)
+; buffertest=BinaryFree(buffertest)
+; bufferResult=BinaryFree(bufferResult)
+; TextValue = "76646174"
+; fieldName = hex2string(textValue)
+; strHex = "62657374616E64006F72676E756D00"
+; listFieldNames = CreateListofStrings(strHex)  ; (pHexString)
+;
+; -- start uitlezen *.DB file ----
+;
+getal = 0
+;  inlezen DB file en header onderzoek
+bericht = Strcat(bericht, filename, @CRLF)
+boxtext(bericht)
+fSize = filesize(filename)  ; mogelijk parameter 2 format filesize aanpassen 
+dbBuf = BinaryAlloc(fSize)
+If dbbuf == 0
+  Message("Error", "BinaryAlloc of data file failed!")
+  goto EINDE
+Else
+  ; Read the file into the buffer.
+  BinaryRead(dbBuf, filename)
+endif
+
+; nu inlezen memo file but first the existence of a .MB file
+if !FileExist(MBfilename) then goto DB_Header
+; start reading the .MB file into the memo Buf(fer)
+fMemoSize = filesize(MBfilename)  ; mogelijk parameter 2 format filesize aanpassen 
+memoBuf = BinaryAlloc(fMemoSize+10)
+If memoBuf == 0
+  Message("Error", "Reading the .MB file into the memoBuffer by the BinaryAlloc Failed, program stops.")
+  goto EINDE
+Else
+  ; Read the file into the buffer.
+  BinaryRead(memoBuf, MBfilename)
+endif
+NrofMemoBlocks = fMemoSize / 4096
+
+:DB_Header 
+; header DB file investigation: The size of the Paradox file header is usually 2048 bytes (see headerSize at file offset 0002).
+hdrRecSize = BinaryPeekHex(dbBuf, 0, 2)   ; Record size
+hdrRecSize = StrLittle2BigEndian(4, hdrRecSize) ; reverse to BigEndian
+recSize = hex2dec(hdrRecSize)
+bericht = StrCat(bericht, "Record size: %recSize%", @CRLF)
+hdrSize = BinaryPeekHex(dbBuf, 2, 2)   ; Header size integer 2-bytes signed
+hdrSize = StrLittle2BigEndian(4, hdrSize) ; reverse to BigEndian
+hdrSizeDec = hex2dec(hdrSize)
+bericht = StrCat(bericht, "Header size: 0x%hdrSize%/%hdrSizeDec%", @CRLF)
+boxtext(bericht)
+NrOfDBBlocks = fSize/hdrSizeDec
+bericht = StrCat(bericht, "Nr of DB blocks (%fSize%/%hdrSizeDec%): %NrOfDBBlocks%", @CRLF)
+hdrFileType = BinaryPeekHex(dbBuf, 4, 1)  ; FileType =  byte
+switch  hdrFileType
+  case "0"
+    FileType  = "Indexed .DB data file"
+    break
+  case "1"
+    FileType  = "PrimaryIndexed .DB data file"
+    break
+  case "2"
+    FileType  = "Non-indexed .DB data file"
+    break
+  case "3"
+    FileType = "non-incrementing secondary index .Xnn file"
+    break
+  case hdrFileType
+    FileType = "Ander filetype ": hdrFileType : ", zie documentatie"
+    break
+endSwitch
+bericht = StrCat(bericht, "File Type: ", FileType, @CRLF)
+boxtext(bericht)
+;  0005 | byte  maxTableSize, This is the "maximum table size" determined when this table was created.  
+;               It really indicates the size of each block of records in the data section of the table.
+hdrmaxTableSize = BinaryPeekHex(dbBuf, 5, 1)
+maxTableSize = hex2dec(hdrmaxTableSize)
+bericht = StrCat(bericht, "Max Table Size: %maxTableSize%", @CRLF)
+;  0006 | longint 4 bytes signed integer | numRecords This is the number of records in this file.
+hdrNumRecs = BinaryPeekHex(dbBuf, 6, 4)
+hdrNumRecs = StrLittle2BigEndian(8, hdrNumRecs) ; omzetten naar BigEndian
+NumRecords = HexToSignedInt(hdrNumRecs, 4*8)
+bericht = StrCat(bericht, "Number Records: %NumRecords%", @CRLF)
+; 000C | word   fileBlocks , This is the number of data blocks in the file. (Each "block" is a cluster of records.)
+hexStr =  BinaryPeekHex(dbBuf, 12, 2)  ; 2 bytes
+hexStr = StrLittle2BigEndian(4, hexStr) ; omzetten naar BigEndian
+hdrNumDataBlocks = Hex2Dec(hexStr)
+bericht = StrCat(bericht, "Number of Data Blocks: " : hexStr : "/%hdrNumDataBlocks%", @CRLF)
+; 000E | word   firstBlock, Always 1 unless the table is empty.
+hexStr =  BinaryPeekHex(dbBuf, 14, 2)
+hexStr = StrLittle2BigEndian(4, hexStr) ; omzetten naar BigEndian
+FirstDataBlock = Hex2Dec(hexStr)
+bericht = StrCat(bericht, "First Data Block: " : hexStr : "/%FirstDataBlock%", @CRLF)
+; 0010 | word   lastBlock, This works out to the number of blocks that the table would contain if every block was packed.
+hexStr =  BinaryPeekHex(dbBuf, 16, 2)
+hexStr = StrLittle2BigEndian(4, hexStr) ; omzetten naar BigEndian
+LastDataBlock = Hex2Dec(hexStr)
+bericht = StrCat(bericht, "Last Data Block: " : hexStr : "/%LastDataBlock%", @CRLF)
+; 0021 | integer  2 byte signed| numFields  This is the number of fields in the table.
+; If this is an index file, then it would only be the number of fields in this index.
+hdrNumFields = BinaryPeekHex(dbBuf, 33, 2)    ; 33d is 0x21
+hdrNumFields = StrLittle2BigEndian(8, hdrNumFields) ; omzetten naar BigEndian
+numFields = HexToSignedInt(hdrNumFields, 2*8)
+bericht = StrCat(bericht, "Number Fields: %numFields%", @CRLF)
+boxtext(bericht)
+hdrNumKeyFieldsHex = BinaryPeekHex(dbBuf, 35, 2)  ; 35d is 0x23
+hdrNumKeyFieldsHex = StrLittle2BigEndian(8, hdrNumKeyFieldsHex)
+numKeyFields = HexToSignedInt(hdrNumKeyFieldsHex, 2*8)
+bericht = StrCat(bericht, "Number Key Fields: %numKeyFields%", @CRLF)
+boxtext(bericht)
+tableNamePtrHex = BinaryPeekHex(dbBuf, 48, 4) ; 48d is 0x30 
+tableNamePtrHex = StrLittle2BigEndian(8, tableNamePtrHex)
+tableNamePtr = hex2dec(tableNamePtrhex)
+bericht = Strcat(bericht, "TableName Pointer: %tableNamePtr%", @CRLF)
+; get the firstfieldNamePtr
+FirstFieldNamePtrHex = BinaryPeekHex(dbBuf, 52, 4)  ; 52d is 0x34 offset
+FirstFieldNamePtrHex = StrLittle2BigEndian(8, FirstFieldNamePtrHex)
+FirstFieldNamePtr = hex2dec(FirstFieldNamePtrHex) 
+bericht = Strcat(bericht, "First FieldName Pointer: %FirstFieldNamePtr%", @CRLF)
+; 0039 | byte  |  fileVersionID
+offset = hex2dec("39") 
+hdrFileVersion = BinaryPeekHex(dbBuf, offset, 1)
+getal = hex2dec(hdrFileVersion)
+Switch getal
+  case "3"
+    FileVersion = "3.0"
+    break
+  case "4"
+    FileVersion = "3.5"
+    break
+  case "10"
+  case "11"
+    FileVersion = "5.x"
+    break
+  case "12"
+    FileVersion = "7.x"
+    break
+  case getal
+    FileVersion = "4.x"
+    break
+EndSwitch
+bericht = Strcat(bericht, "Paradox version: ", FileVersion, @CRLF)
+numFirstFreeBlockHex = BinaryPeekHex(dbBuf, 77, 2)  ; 77d is 0x4D number of first free block
+numFirstFreeBlockHex = StrLittle2BigEndian(8, numFirstFreeBlockHex)
+numFirstFreeBlock = HexToSignedInt(numFirstFreeBlockHex, 2*8)
+bericht = StrCat(bericht, "Number First Free Block: %numFirstFreeBlock%", @CRLF)
+boxtext(bericht)
+; inlezen array [1.. numFields]
+if Fileversion == "5.x" || FileVersion == "7.x" then
+   byteOffset = "0078"
+   lenTableName = 261  ; will be used later in the program
+else
+   byteOffset = "0058"
+   lenTableName = 79
+endif
+offset = hex2dec(byteOffset)
+listFieldInfo = ""
+fieldInfo = ""
+fld1 = ""
+strfieldLen = ""
+b = offset-2
+decimals(0)
+for i=1 to numFields
+  b = b+2  ; we lezen steeds 2 bytes uit
+  fieldInfo = binaryPeekHex(dbBuf,b,2)
+  fld1 = StrSub(fieldInfo, 1,2)
+  fld2 = StrSub(fieldInfo, 3,2)
+  fieldType = GetFieldTypedesc(fld1)
+  fieldLen = hex2dec(fld2)
+  strFieldLen = "%fieldLen%"
+  if i > 9 then
+    listFieldInfo = StrCat(listFieldInfo, "fldname%i%|", fieldInfo, "|", fieldType, "|", strFieldLen, ";")
+  else
+    listFieldInfo = StrCat(listFieldInfo, "fldname0%i%|", fieldInfo, "|", fieldType, "|", strFieldLen, ";")
+  endif
+next
+fieldCount = Itemcount(listFieldInfo, ";") - 1
+test = ItemExtract(fieldCount, listFieldInfo, ";")
+
+; calculate now offset with + 4 bytes pointer en numFields*4
+offset= 146 ;  offset-1+numFields+4+numFields*4
+tableName = BinaryPeekStr(dbBuf, offset, lenTablename)
+offset = 224
+; search the term  f1,   maximum fieldName length is 25 characters
+; Field names start at byteOffset 120d (78h) plus 83 plus 6 times the number of fields. 
+; Field names are in field number sequence. Each field name is a null-terminated string (00h marks the end of the ring).
+SumFieldNameLength = 25*numFields
+offset = hex2dec(byteOffset) +83+6*numFields
+idx = BinaryIndex(dbBuf, offset, "f1", @FWDSCAN )  ; search for last fieldname (f1) ?todo aanpassen tbv andere .DB files
+hexfieldNames = BinaryPeekHex(dbBuf, offset, SumFieldNameLength)     ;; idx-offset)   gddprs 943 is startposition, lengte 792 endpos. is 1733 but we use a bit longer
+; skip prefix of '00' values
+hexfieldNames = skipLeadingZeroes(hexfieldNames) 
+listFieldNames = CreateListofStrings(hexfieldnames, numFields)
+fieldNamesCount = ItemCount(listFieldNames, ";") - 1
+; match and integrate listFieldInfo with listFieldNames
+decimals(0)
+for i= 1 to fieldNamesCount
+  fieldName = ItemExtract(i,listFieldNames, ";")
+  if i > 9 then
+    listFieldInfo = StrReplace(listFieldInfo, "fldname%i%", fieldName)
+  else
+    listFieldInfo = StrReplace(listFieldInfo, "fldname0%i%", fieldName)
+  endif
+next
+bericht = Strcat(bericht, "Nr of fieldNames: %fieldNamesCount%", @CRLF)
+boxtext(bericht)
+if fieldCount <> fieldNamesCount then
+   bericht = Strcat(bericht, "Nr of FieldInfo_list <> Nr of FieldNames", @CRLF)
+   Message("ReadParadocMemo", "Nr of FieldInfo_list <> Nr of FieldNames")
+endif
+; detemine of there is a BLOB or Graphic field present
+if (StrIndex(listFieldInfo,"BLOb", 1, @FWDSCAN) > 0 || StrIndex(listFieldInfo,"Graphic", 1, @FWDSCAN) > 0) then ; create a sub folder to store the BLobs
+   BLOB_Present = @TRUE
+   BLOB_Dir = filepath(filename)
+   BlOB_Subdir = fileroot(filename)
+   BLOB_Dir = StrReplace(BLOB_Dir : "\" : BLOB_Subdir, "\\", "\")
+   if !DirExist(BLOB_Dir) then
+     OK = DirMake(BLOB_Dir)
+   endif
+   BLOB_Dir = BLOB_Dir : "\"
+endif
+; open and write header data into the logfile
+; Message("Read Paradox Memo", bericht)
+fhlog = fileOpen(logfilename, "WRITE")
+filewrite(fhlog, bericht)
+filewrite(fhlog, "De Lijst veldnamen: ")
+for i = 1 to numfields
+  filewrite(fhlog, strcat(ItemExtract(i, listfieldInfo, ";")) )
+next
+; memo MB file investigation
+filewrite(fhlog, @CRLF : "MB file header investigation:")
+filewrite(fhlog, "Number of MB blocks : %NrOfMemoBlocks%")
+MB_byte0 = BinaryPeekHex(memoBuf, 0, 1)      ; recordtype (e.g., "MB ")
+filewrite(fhlog, StrCat("Record type byte0: ", MB_byte0))
+MB_byte1 = BinaryPeekHex(memoBuf, 1, 1)      ; Size of block divided by 4k, value 1 because the header is 4k
+filewrite(fhlog, StrCat("Size of block byte1: ", MB_byte1))
+MB_byte2 = BinaryPeekHex(memoBuf, 2, 1)       ; off set first record
+filewrite(fhlog, StrCat("byte 2: ", MB_byte2))
+MB_byte3 = BinaryPeekHex(memoBuf, 3, 1)       ; 
+filewrite(fhlog, StrCat("byte 3 length?: ", MB_byte3))
+MB_byte9 = BinaryPeekHex(memoBuf, 9, 1)
+filewrite(fhlog, StrCat("byte 9 ?: ", MB_byte9))
+; block at position 4096
+filewrite(fhlog, "first memo block 4096: the first 12 bytes - see paradox4x.txtMB structure")
+MB_byte0 = BinaryPeekHex(memoBuf, 4096, 1)      ; Recordtype 03h ??
+filewrite(fhlog, StrCat("record type byte0: ", MB_byte0))
+MB_byte1 = BinaryPeekHex(memoBuf, 4097, 1)       ; Size of block
+filewrite(fhlog, StrCat("Size of block byte 1: ", MB_byte1))
+MB_bytes2_12 = BinaryPeekHex(memoBuf, 4098, 10)    ; geen idee wat die inhouden
+filewrite(fhlog, StrCat("rest of the 12 bytes: ", MB_bytes2_12))
+memoStr = ""
+GOTO  CONTINUE_DB
+;
+; investigate the array of 64 entries, each 5 bytes, we are looping them backwards:
+filewrite(fhlog,"Test of the offsets on the basis of the array of entries: ")
+MB_arrayEntries = BinaryPeekHex(memoBuf, 4108, 320) ; starting at byte 0x00C0 (12) and 64 X 5 Bytes = 320 long
+strL = StrLen(MB_arrayEntries)
+decimals(10)
+i = 63  ; index runs from 00h tot 3Fh (63 decimal), the first one is at the end of the array and reads backwords
+a = 0  ; aantal gevulde entries - number of used (filled) entries 
+while i > -1
+  MB_entry = StrSub(MB_arrayEntries, strL-9,10)  ; 5 bytes, 2 hex characters makes 10
+  dataOffset = 16*hex2dec(StrSub(MB_entry, 1,2))
+  dataLength = 16*hex2dec(StrSub(MB_entry, 3,2))  ; add the modulo later
+  dataModification = StrLittle2BigEndian(2, StrSub(MB_entry, 5,4)) ; if 1 then table restructure
+  dataModulo = hex2dec(StrSub(MB_entry, 9,2)) ;  
+  ; dataLength += dataModulo   ; JWT switched of
+  filewrite(fhlog, StrCat("entry %i%, MB_entry=", MB_entry, ", dataOffset=%dataOffset%, dataLength=%dataLength%, DataModification=%dataModification%, DataModulo=%dataModulo%"))
+  ; now we can get the text from the memo buffer
+  p = dataOffset+4096
+  memoStr = BinaryPeekStr(memoBuf, p, dataLength)
+  filewrite(fhlog, StrCat("entry %i%=", memoStr) )
+  a += 1
+  strL -= 10  ; subtract 10 characters (5 bytes)
+  i -= 1  ; looping backwords
+  if dataOffset == 0 && datalength == 0 then
+    filewrite(fhlog, "We stoppen bij entry i=%i%, aantal gevulde entries %a%.")
+    a -= 1  ; we count one to many.
+    break
+  endif
+end while
+;
+:CONTINUE_DB
+filewrite(fhlog, ";---------- logging data records ----------")
+boxtext(StrCat(bericht, @CRLF,"---------- data records ----------", @CRLF))
+; start reading datablocks e.v. , each datablock start with byte 0x0006
+startDataBlock = hdrSizeDec
+dataBlockNbr = 1
+; startNextDataBlock = startDataBlock + 4096*dataBlockNbr + 6  ; block offset = block length * ( block number - 1 ) + table header length=6 bytes
+; conform document PxFormat.txt (document PARADOX4x.txt is different in this respect
+nextblockHex = BinaryPeekHex(dbBuf, startDataBlock, 2)   ;  0x0000 | word  nextBlock (block number + ???)
+nextblockHex = StrLittle2BigEndian(4, nextblockHex)      ; test if it is LittleEndian
+nextblock =  hex2dec(nextblockHex)
+blockNumberHex = BinaryPeekHex(dbBuf, startDataBlock+2, 2)  ;  0x0002 | word   blockNumber, The first block is numbered zero. See dataBlockNbr
+blockNumberHex = StrLittle2BigEndian(4, blockNumberHex)
+blockNumber = hex2dec(blockNumberHex)
+addDataSizeHex = BinaryPeekHex(dbBuf, startDataBlock+4, 2)  ; 0004 | integer   addDataSize. This represents the amount of data in this block
+;                                                             in addition to one record length.
+;                                                             This will be a zero if there is one record in this block,
+;                                                             and a negative number if there are no records.               |
+;                                                             numRecsInBlock = (addDataSize / recordSize) + 1 
+addDataSizeHex = StrLittle2BigEndian(4,addDataSizeHex)
+addDataSize = hex2dec(addDataSizeHex)
+NrofRecordsInBlock = floor((addDataSize)/recSize + 1)
+StartNextRecord = startDataBlock+6     ; 1ste datarecord
+listMemoBlocks = ""   ;; recordnr;offset;lengte;blocknr;unused|recordnr2;....| in integers
+decimals(0)
+filewrite(fhlog, "Start DataBlock: %startDataBlock%")
+filewrite(fhlog, "Start NextRecord: %startNextRecord%")
+filewrite(fhlog, "Next Block: %nextBlock%")
+filewrite(fhlog, "addDataSize: %addDataSize%")
+filewrite(fhlog, "Nr of Records in data block: %NrOfRecordsInBlock%")
+;
+fhrecs = fileopen(recsfilename, "WRITE")
+; herleiden field waarden
+DateValue = ""
+LongValue = 0
+LogicValue = 0
+CurValue = 0.00
+CurValueHex = ""
+TextValue = ""
+MemoValue = ""        ; to decipher the memoBlob
+memoPart = ""
+memoStr = ""
+MBBlockType = 0       ; also named RecordType, values Type2 = 2 Single Block, Type3 = Suballocated Block, Type 4 is Free blovk
+MBIndexHex = ""
+MBIndex = 0
+MBOffset = 0        ; is the startposition of the MB block
+prevMBOffset = 0    ; the previous MB Block, if prevMBOffset <> MBOffset then check which BlockType this block is: type 2 single block
+                    ; type 3 then use Array of Entries
+MBBlockSize = 0
+memoLength = 0
+memoBlocknr = 0
+memoUnused = 0
+memoModnr = 0         ; according to paradox4x.txt
+memoLen = 0           ; length Hex memovalue
+IDNr = 0
+doorgaan = @TRUE  ; for all records do
+r = 0             ; record counter 1..total of records
+rb= 0             ; record counter in datablock
+while doorgaan
+  r = r + 1   ; record teller ophogen
+  rb = rb + 1
+  filewrite(fhrecs, ";---------- data record %r%, startNextRecord %StartNextRecord% ----------")
+  dataRecHex = BinaryPeekHex(dbBuf, StartNextRecord, RecSize)
+  b = 1  ; start with the 1ste Record fieldname
+  for fldNr= 1 to NumFields
+    fieldInfo = ItemExtract(fldnr, listFieldInfo, ";")
+    fieldName = ItemExtract(1, fieldInfo, "|")
+    fieldType = ItemExtract(3, fieldInfo, "|")
+    fieldLen  = ItemExtract(4, fieldInfo, "|")*1
+    if fieldType == "Text" then
+      TextValue = StrSub(dataRecHex, b,fieldLen*2)       ; lengte in bytes
+      if fldNr > 4 then 
+        TextValue = StrTrimPrefix0x0(TextValue)
+      endif
+      TextValue = hex2String(TextValue)
+      b = b+fieldLen*2
+      fileWrite(fhrecs, fieldName: "=" : TextValue)
+    elseif fieldType == "AutoInc" then
+      recInteger  = StrSub(dataRecHex, b,8)  ; 4 bytes = 4*2 hex - the hex string can start wit an 8, we skip it, see PARADOX04.txt
+      if StrSub(recInteger,1,1) == "8" then
+         recInteger = StrSub(recInteger, 2, -1)
+      endif
+      LongValue = hex2dec(recInteger)   ; HexToSignedInt(recInteger, 8*4)       ; todo   check waarde zou 1 moeten zijn
+      b = b + 8
+      fileWrite(fhrecs, fieldName : "=%LongValue%")
+      if fieldName == "ID" then
+        IDnr = LongValue
+      endif
+    elseif fieldType == "Currency" then
+      CurValueHex  = StrSub(dataRecHex, b,16)  ; 8 bytes = 8*2 hex - floating point
+      CurValue = hex2float(CurValueHex)   ; ?todo 
+      b = b + 16
+      decimals(2)
+      fileWrite(fhrecs, fieldName : "=%CValue%")
+    elseif fieldType == "Long" then
+      recInteger  = StrSub(dataRecHex, b,8)  ; 4 bytes = 4*2 hex - the hex string can start wit an 8, we skip it, see PARADOX04.txt
+      if StrSub(recInteger,1,1) == "8" then
+         recInteger = StrSub(recInteger, 2, -1)
+      endif
+      LongValue = hex2dec(recInteger)   ; HexToSignedInt(recInteger, 8*4)       ; todo   check waarde zou 1 moeten zijn
+      b = b + 8
+      fileWrite(fhrecs, fieldName : "=%LongValue%")
+      if fieldName == "recordnr" then
+         recordNr = LongValue
+      endif
+    elseif fieldType == "Short" then
+      recInteger  = StrSub(dataRecHex, b,4)  ; 2 bytes = 2*2 hex - the hex string can start wit an 8, we skip it, see PARADOX04.txt
+      if StrSub(recInteger,1,1) == "8" then
+         recInteger = StrSub(recInteger, 2, -1)
+      endif
+      LongValue = hex2dec(recInteger)   ; HexToSignedInt(recInteger, 8*4)       ; todo   check waarde zou 1 moeten zijn
+      b = b + 4
+      fileWrite(fhrecs, fieldName : "=%LongValue%")
+    elseif fieldType == "Logical" then
+      recInteger  = StrSub(dataRecHex, b,2)
+      LogicValue = hex2dec(recInteger)
+      b = b + 2
+      fileWrite(fhrecs, fieldName : "=%LogicValue%")
+    elseif fieldType == "Timestamp" then
+      TextValue  = StrSub(dataRecHex, b,fieldLen*2)   ; fieldLen == 8 so times x 2 to get Hex length
+      DateValue = HexTimeStamp2ISODate(TextValue)
+      b = b + fieldLen*2
+      ;  fileWrite(fhrecs, "; " : fieldName : "=%DateValue%/" : TextValue)  ; for testing
+      fileWrite(fhrecs, fieldName : "=" : DateValue)
+    elseif fieldType == "Date" then             ; recInteger is number of Days since the date 1/1/1
+      TextValue  = StrSub(dataRecHex, b,fieldLen*2)   ; veldlengte 8 dus x 2  !todo  rechts
+      DateValue = HexDate2ISODate(TextValue)     ; ?todo does not return the correct date and time
+      b = b + fieldLen*2
+      if DateValue == "00010101" then ; if returns this than empty date
+        DateValue = ""
+      endif
+      fileWrite(fhrecs, fieldName : "=" : DateValue)
+    elseif fieldType == "MemoBLOb" then
+      memoValue = StrSub(dataRecHex, b, fieldLen*2); !todo  length is 11 bytes or max 12..250
+      memoLen = StrLen(memoValue)
+      memoPart = StrSub(memoValue, memoLen-7, 4*2)        ; get memoModnr
+      memoPart = StrLittle2BigEndian(8, memoPart)
+      memoModnr = hex2dec(memoPart)
+      memoPart = StrSub(memoValue, memoLen-11, 2*2)        ; get memoLength
+      memoPart = StrLittle2BigEndian(4, memoPart)
+      memoLength = hex2dec(memoPart)
+      memoPart = StrSub(memoValue, memoLen-19, 4*2)        ; get memoOffset
+      ;  memoPart = StrLittle2BigEndian(8, memoPart)  ; tijdelijk uitgezet volgens Jeroen van Dael is BigEndian
+      if memoLen > 22 then
+         memoStr = StrSub(memoValue,1, memoLen-22)
+         memoStr = hex2String(memoStr)
+      else 
+        memoStr = ""
+      endif
+        MBOffsetHex = StrSub(memoPart, 3,4)
+        MBOffset = hex2dec(MBOffsethex)
+        MBIndexhex =  StrSub(memoPart, 1,2)
+        if MBIndexHex == "FF" then
+           MBBlockType = 2
+        else
+          MBBlockType = 3
+        endif
+        MBIndex = hex2dec(MBIndexHex)
+;       memoUnused = hex2dec(memoPart)
+        ; listMemoBlocks = StrCat(listMemoBlocks, "%recordNr%;" : fieldName : ";%memoOffset%;%memoLength%;%memoBlocknr%;%memoUnused%|")
+        filewrite(fhrecs, ";-- rec=%recordNr%;" : fieldName : "=memoBlob:": memoValue: ";%MBOffset%;%MBIndex%;%memoLength%;%memoModnr%;BlockType=%MBBlockType%")
+        ; ophalen memoBlob text als MBOffset!= 0
+        if MBOffset > 0 then
+           if MBOffset <> prevMBOffset then 
+              prevMBOffset = MBOffset
+              ; determine whether byte xx of the block header is type 2 or 3
+              MBRecordType = BinaryPeek(memobuf, MBOffset)            ; byte 0x0000
+              MBBlockSizeHex  = BinaryPeekHex(memobuf,MBOffset+1, 2)  ; byte 0x0001
+              MBBlockSizeHex = StrLittle2BigEndian(4,MBBlockSizeHex)  ; notation is little endian
+              MBBlockSize = hex2dec(MBBlockSizeHex)
+              MBBlockSize = MBBlockSize * 4096
+              MBBlobLengthHex = BinaryPeekHex(memobuf,MBOffset+3, 2)     ; byte 0x00
+              MBBlobLengthHex =  StrLittle2BigEndian(4, MBBlobLengthHex) ; notation is little endian
+              MBBlobLength = hex2dec(MBBlobLengthHex)  ; check if it's the right size
+           endif
+           if MBRecordType == 2 then
+             filewrite(fhlog, ";-- rec=%recordNr%;" : fieldName : "=memoBlob:": memoValue: ";%MBOffset%;%MBIndex%;%memoLength%;%memoModnr%")
+             filewrite(fhlog, "   Blob recordtype 2, MBLob length " : MBBlobLengthHex)
+             memoStr = BinaryPeekStr(memoBuf, MBOffSet+9, MBBlobLength) ;  memo text starts at byte 0x0009
+           elseif MBRecordType == 3 then
+             MB_Pos = MBOffset + 12 + 5*MBIndex
+             MB_entry = BinaryPeekHex(memoBuf, MB_Pos, 5)
+             dataOffset = 16*hex2dec(StrSub(MB_entry, 1,2))
+             dataLength = 16*hex2dec(StrSub(MB_entry, 3,2))  ; !todo nog de modulo bij optellen
+             dataModification = StrLittle2BigEndian(2, StrSub(MB_entry, 5,4)) ; indien 1 dan table restructure
+             dataModulo = hex2dec(StrSub(MB_entry, 9,2)) ;
+             p = dataOffset+MBOffset  ; // 4096
+             memoStr = BinaryPeekStr(memoBuf, p, dataLength)
+           else ;; this is probably an error
+             filewrite(fhlog, ";-- rec=%recordNr%;" : fieldName : "=memoBlob:": memoValue: ";%MBOffset%;%MBIndex%;%memoLength%;%memoModnr%")
+             filewrite(fhlog, "   Blob recordtype %MBRecordType%, MBLob length " : MBBlobLengthHex : ", onbekend")
+             ; todo code
+           endif
+        else ;  MBOffset == 0
+          memoStr = ""
+          filewrite(fhlog, ";-- rec=%recordNr%;" : fieldName : "=memoBlob:": memoValue: ";%MBOffset%;%MBIndex%;%memoLength%;%memoModnr%")
+        endif
+      filewrite(fhrecs, fieldName : "=" : memoStr )
+      filewrite(fhrecs, "/" : fieldName)
+      b = b + fieldLen*2
+    elseif (fieldType == "BLOb" || fieldType == "Graphic") then
+      memoValue = StrSub(dataRecHex, b, fieldLen*2); !todo  length is 11 bytes or max 12..250
+      memoLen = StrLen(memoValue)
+      memoPart = StrSub(memoValue, memoLen-7, 4*2)        ; get memoModnr
+      memoPart = StrLittle2BigEndian(8, memoPart)
+      memoModnr = hex2dec(memoPart)
+      memoPart = StrSub(memoValue, memoLen-11, 2*2)        ; get memoLength
+      memoPart = StrLittle2BigEndian(4, memoPart)
+      memoLength = hex2dec(memoPart)
+      memoPart = StrSub(memoValue, memoLen-19, 4*2)        ; get memoOffset
+      filewrite(fhlog, ";-- rec=%recordNr%;" : fieldName : "=" : fieldType : "; " : memoValue : ";%MBOffset%;%MBIndex%;%memoLength%;%memoModnr%")
+      MBOffsetHex = StrSub(memoPart, 3,4)
+      MBOffset = hex2dec(MBOffsethex)
+      MBIndexhex =  StrSub(memoPart, 1,2)
+      if MBIndexHex == "FF" then
+         MBBlockType = 2
+         memoStr = BinaryPeekHex(memoBuf, MBOffSet+9, memoLength) ;  memo text starts at byte 0x0009
+         filewrite(fhrecs, fieldName : "=" : memoStr )
+         filewrite(fhrecs, "/" : fieldName)
+      else
+         MBBlockType = 3
+         MBIndex = hex2dec(MBIndexHex)
+         MB_Pos = MBOffset + 12 + 5*MBIndex
+         MB_entry = BinaryPeekHex(memoBuf, MB_Pos, 5)
+         dataOffset = 16*hex2dec(StrSub(MB_entry, 1,2))
+         dataLength = 16*hex2dec(StrSub(MB_entry, 3,2))  ; nog de modulo bij optellen
+         dataModification = StrLittle2BigEndian(2, StrSub(MB_entry, 5,4)) ; indien 1 dan table restructure
+         dataModulo = hex2dec(StrSub(MB_entry, 9,2)) ;
+         p = dataOffset+MBOffset  ; // 4096
+         memoStr = BinaryPeekHex(memoBuf, p, dataLength)
+         memoLength = dataLength
+         filewrite(fhrecs, fieldName : "=" : memoStr )
+         filewrite(fhrecs, "/" : fieldName)
+      endif
+      ;  check what kind of Blob or Graphic the output file will be.
+      if memoLength > 1 then
+         BLOB_FileType = strSub(memoStr, 1, 4)
+         if BLOB_FileType == "8950" then
+           BLOB_FileType = ".PNG"
+         elseif BLOB_FileType == "FFD8" then
+           BLOB_FileType = ".JPG"
+         elseif BLOB_FileType == "4749" then
+           BLOB_FileType = ".GIF"
+         elseif BLOB_FileType == "4949" then
+           BLOB_FileType = ".TIFF"
+         else
+           BLOB_FileType = ".BIN"
+         endif
+         BLOBFileName = BLOB_Dir : fieldName : "ID%IDNr%": BLOB_FileType
+         hdlBLOB = BinaryAlloc(memoLength)
+         BinaryPokeHex(hdlBLOB, 0, memoStr)
+         size = BinaryWrite(hdlBLOB,BLOBFileName)
+         hdlBLOB = BinaryFree(hdlBLOB)
+      endif
+      b = b + fieldLen*2
+    else  ; not yet fieldType implemented or wrong fieldtype
+      b = b +fieldLen*2
+      fileWrite(fhrecs, fieldName : "=" : fieldType : " nog implementeren !todo")
+    endif
+  next ; flrNr
+  BoxText(strcat(bericht, @crlf, "Data Record : %r%"))
+  ; nog nieuwe StartNextRecord berekenen !todo
+  if rb < NrOfRecordsInBlock then  ; go to next datablock
+    StartNextRecord = StartNextRecord + recSize   ; ?todo nog bepalen of dit klopt
+  else
+     ; StartNextrecord = StartNextDataBlock
+     dataBlockNbr += 1
+     ;          pos = startDataBlock+6+addDataSize+recSize+1
+     StartDataBlock = startNextRecord + recSize  ; check  DataBlock+6+addDataSize+recSize+1   ; bepaal start position of this next block
+     StartDataBlock = 1024 + 1024*floor(StartDataBlock/1024)
+     StartNextRecord = StartDataBlock + 6                      ; start at first record in this datablock
+     nextblockHex = BinaryPeekHex(dbBuf, startDataBlock, 2)    ; 0x0000 | word  nextBlock (block number + ???)
+     nextblockHex = StrLittle2BigEndian(4, nextblockHex)      ; test if it is LittleEndian
+     nextblock =  hex2dec(nextblockHex)
+     blockNumberHex = BinaryPeekHex(dbBuf, startDataBlock+2, 2)  ;  0x0002 | word   blockNumber, The first block is numbered zero. See dataBlockNbr
+     blockNumberHex = StrLittle2BigEndian(4, blockNumberHex)
+     blockNumber = hex2dec(blockNumberHex)
+     addDataSizeHex = BinaryPeekHex(dbBuf, startDataBlock+4, 2)  ; 0004 | integer   addDataSize. This represents the amount of data in this block
+     ;                                                             in addition to one record length.
+     ;                                                             This will be a zero if there is one record in this block,
+     ;                                                             and a negative number if there are no records.               |
+     ;                                                             numRecsInBlock = (addDataSize / recordSize) + 1 
+     addDataSizeHex = StrLittle2BigEndian(4,addDataSizeHex)
+     addDataSize = hex2dec(addDataSizeHex)
+     NrofRecordsInBlock = floor((addDataSize)/recSize + 1)
+     ; listMemoBlocks = ""   ;; recordnr;offset;lengte;blocknr;unused|recordnr2;....| in integers
+     decimals(0)
+     filewrite(fhlog, "Start DataBlock: %startDataBlock%")
+     filewrite(fhlog, "Start NextRecord: %startNextRecord%")
+     filewrite(fhlog, "Next Block: %nextBlock%")
+     filewrite(fhlog, "addDataSize: %addDataSize%")
+     filewrite(fhlog, "Nr of Records in data block: %NrOfRecordsInBlock%")
+     rb = 0 ; reset records_in_block counter 
+  endif
+  if r >= NumRecords then doorgaan = @false ;  stoppen alle records gehad
+endwhile ; continue until all records are proecessed
+
+; Message("memoblocks", listMemoBlocks)
+; close files
+fileclose(fhlog)
+fileclose(fhrecs) 
+
+:EINDE
+dbBuf=BinaryFree(dbBuf)
+memoBuf=BinaryFree(memoBuf)
+exit
+
