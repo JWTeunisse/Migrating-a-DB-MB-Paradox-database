@@ -6,6 +6,6 @@ In this repository you will find a PDF article with a description of the DB and 
 
 Also is included the source code of a prototype program, coded in Winbatch (a sort of basic/fortran like programming language called WIL).
 
-More information will be find on my <a target="new" href="https://www.jwteunisse.nl\artparadoxdbmb.html">website articles</a>.
+More information can be find on my <a target="new" href="https://www.jwteunisse.nl\artparadoxdbmb.html">website articles</a>.
 
 J.W. Teunisse, edited 20-2-2025 (added a URL to more information). 
